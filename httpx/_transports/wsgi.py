@@ -28,13 +28,29 @@ def _skip_leading_empty_chunks(body: typing.Iterable[_T]) -> typing.Iterable[_T]
 
 
 class WSGIByteStream(SyncByteStream):
-    def __init__(self, result: typing.Iterable[bytes]) -> None:
+    def __init__(
+        self,
+        result: typing.Iterable[bytes],
+        raise_app_exceptions: bool = True,
+    ) -> None:
         self._close = getattr(result, "close", None)
-        self._result = _skip_leading_empty_chunks(result)
+        self._raise_app_exceptions = raise_app_exceptions
+        self.raised = False
+        try:
+            self._result = _skip_leading_empty_chunks(result)
+        except Exception:
+            if self._raise_app_exceptions:
+                raise
+            self.raised = True
+            self._result = iter(())
 
     def __iter__(self) -> typing.Iterator[bytes]:
-        for part in self._result:
-            yield part
+        try:
+            for part in self._result:
+                yield part
+        except Exception:
+            if self._raise_app_exceptions:
+                raise
 
     def close(self) -> None:
         if self._close is not None:
@@ -131,16 +147,33 @@ class WSGITransport(BaseTransport):
             seen_exc_info = exc_info
             return lambda _: None
 
-        result = self.app(environ, start_response)
+        app_raised = False
+        try:
+            result = self.app(environ, start_response)
+        except Exception:
+            if self.raise_app_exceptions:
+                raise
+            app_raised = True
+            result = iter(())
 
-        stream = WSGIByteStream(result)
+        stream = WSGIByteStream(result, self.raise_app_exceptions)
 
-        assert seen_status is not None
+        if seen_status is None:
+            if not app_raised and not stream.raised:
+                raise RuntimeError(
+                    "The WSGI application returned a response without calling "
+                    "start_response()."
+                )
+            status_code = 500
+            seen_response_headers = []
+        else:
+            assert seen_response_headers is not None
+            if seen_exc_info and seen_exc_info[0] and self.raise_app_exceptions:
+                raise seen_exc_info[1]
+            status_code = int(seen_status.split()[0])
+
         assert seen_response_headers is not None
-        if seen_exc_info and seen_exc_info[0] and self.raise_app_exceptions:
-            raise seen_exc_info[1]
 
-        status_code = int(seen_status.split()[0])
         headers = [
             (key.encode("ascii"), value.encode("ascii"))
             for key, value in seen_response_headers

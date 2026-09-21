@@ -201,3 +201,116 @@ def test_wsgi_server_protocol():
     assert response.status_code == 200
     assert response.text == "success"
     assert server_protocol == "HTTP/1.1"
+
+
+def raise_before_start_response(
+    environ: WSGIEnvironment, start_response: StartResponse
+) -> typing.Iterable[bytes]:
+    raise RuntimeError("App exploded before start_response.")
+
+
+def raise_after_start_response(
+    environ: WSGIEnvironment, start_response: StartResponse
+) -> typing.Iterable[bytes]:
+    start_response("200 OK", [("Content-Type", "text/plain")])
+    raise RuntimeError("App exploded after start_response.")
+
+
+def raise_during_streaming(
+    environ: WSGIEnvironment, start_response: StartResponse
+) -> typing.Iterator[bytes]:
+    start_response("200 OK", [("Content-Type", "text/plain")])
+    yield b"partial"
+    raise RuntimeError("App exploded while streaming the response body.")
+
+
+def never_calls_start_response(
+    environ: WSGIEnvironment, start_response: StartResponse
+) -> typing.Iterable[bytes]:
+    return []
+
+
+def generator_raises_before_start_response(
+    environ: WSGIEnvironment, start_response: StartResponse
+) -> typing.Iterator[bytes]:
+    raise RuntimeError("App exploded while the response iterator was primed.")
+    yield b""  # pragma: no cover
+
+
+
+
+def test_wsgi_exc_no_raise_before_start_response():
+    transport = httpx.WSGITransport(
+        app=raise_before_start_response, raise_app_exceptions=False
+    )
+    client = httpx.Client(transport=transport)
+    response = client.get("http://www.example.org/")
+    assert response.status_code == 500
+
+
+def test_wsgi_exc_no_raise_generator_priming():
+    transport = httpx.WSGITransport(
+        app=generator_raises_before_start_response,
+        raise_app_exceptions=False,
+    )
+    client = httpx.Client(transport=transport)
+    response = client.get("http://www.example.org/")
+    assert response.status_code == 500
+
+
+def test_wsgi_exc_raise_generator_priming():
+    transport = httpx.WSGITransport(app=generator_raises_before_start_response)
+    client = httpx.Client(transport=transport)
+    with pytest.raises(RuntimeError):
+        client.get("http://www.example.org/")
+
+
+def test_wsgi_exc_no_raise_after_start_response():
+    transport = httpx.WSGITransport(
+        app=raise_after_start_response, raise_app_exceptions=False
+    )
+    client = httpx.Client(transport=transport)
+    response = client.get("http://www.example.org/")
+    assert response.status_code == 200
+
+
+def test_wsgi_exc_no_raise_during_streaming():
+    transport = httpx.WSGITransport(
+        app=raise_during_streaming, raise_app_exceptions=False
+    )
+    client = httpx.Client(transport=transport)
+    response = client.get("http://www.example.org/")
+    assert response.status_code == 200
+    assert response.content == b"partial"
+
+
+def test_wsgi_exc_raise_before_start_response():
+    transport = httpx.WSGITransport(app=raise_before_start_response)
+    client = httpx.Client(transport=transport)
+    with pytest.raises(RuntimeError):
+        client.get("http://www.example.org/")
+
+
+def test_wsgi_exc_raise_after_start_response():
+    transport = httpx.WSGITransport(app=raise_after_start_response)
+    client = httpx.Client(transport=transport)
+    with pytest.raises(RuntimeError):
+        client.get("http://www.example.org/")
+
+
+def test_wsgi_exc_raise_during_streaming():
+    transport = httpx.WSGITransport(app=raise_during_streaming)
+    client = httpx.Client(transport=transport)
+    with pytest.raises(RuntimeError):
+        client.get("http://www.example.org/")
+
+
+@pytest.mark.parametrize("raise_app_exceptions", [True, False])
+def test_wsgi_app_without_start_response(raise_app_exceptions):
+    transport = httpx.WSGITransport(
+        app=never_calls_start_response,
+        raise_app_exceptions=raise_app_exceptions,
+    )
+    client = httpx.Client(transport=transport)
+    with pytest.raises(RuntimeError, match="start_response"):
+        client.get("http://www.example.org/")
