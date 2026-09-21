@@ -28,13 +28,20 @@ def _skip_leading_empty_chunks(body: typing.Iterable[_T]) -> typing.Iterable[_T]
 
 
 class WSGIByteStream(SyncByteStream):
-    def __init__(self, result: typing.Iterable[bytes]) -> None:
+    def __init__(
+        self, result: typing.Iterable[bytes], raise_app_exceptions: bool = True
+    ) -> None:
         self._close = getattr(result, "close", None)
         self._result = _skip_leading_empty_chunks(result)
+        self._raise_app_exceptions = raise_app_exceptions
 
     def __iter__(self) -> typing.Iterator[bytes]:
-        for part in self._result:
-            yield part
+        try:
+            for part in self._result:
+                yield part
+        except Exception:
+            if self._raise_app_exceptions:
+                raise
 
     def close(self) -> None:
         if self._close is not None:
@@ -131,12 +138,24 @@ class WSGITransport(BaseTransport):
             seen_exc_info = exc_info
             return lambda _: None
 
-        result = self.app(environ, start_response)
+        try:
+            result = self.app(environ, start_response)
+            stream = WSGIByteStream(
+                result, raise_app_exceptions=self.raise_app_exceptions
+            )
+        except Exception:
+            if self.raise_app_exceptions:
+                raise
+            if seen_status is None:
+                seen_status = "500 Internal Server Error"
+                seen_response_headers = []
+            stream = WSGIByteStream([], raise_app_exceptions=False)
 
-        stream = WSGIByteStream(result)
-
-        assert seen_status is not None
-        assert seen_response_headers is not None
+        if seen_status is None or seen_response_headers is None:
+            raise RuntimeError(
+                "WSGI app did not call start_response before returning. "
+                "A response status and headers are required."
+            )
         if seen_exc_info and seen_exc_info[0] and self.raise_app_exceptions:
             raise seen_exc_info[1]
 
